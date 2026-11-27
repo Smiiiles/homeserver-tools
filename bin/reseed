@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+import hashlib, re, http.cookiejar, json, os, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+
+BASE = "/var/lib/reseed"
+DB = BASE + "/db.json"
+QB = "http://localhost:8090"
+QB_ENV = "/etc/onepace-sync/qbit.env"
+ROOTS = {"/mnt/1tbhdd": "/1tbhdd/downloads", "/mnt/4tbhdd": "/4tbhdd/downloads"}
+CATEGORY = "reseed"
+CHECKING = ("checkingUP", "checkingDL", "checkingResumeData", "queuedForChecking", "metaDL", "moving", "allocating")
+
+
+def norm(x):
+    return re.sub(r"[^a-z0-9]+", " ", x.lower()).strip()
+
+
+def die(m):
+    print(m)
+    sys.exit(1)
+
+
+def load_env(p):
+    d = {}
+    with open(p) as f:
+        for l in f:
+            l = l.strip()
+            if "=" in l and not l.startswith("#"):
+                k, v = l.split("=", 1)
+                d[k.strip().removeprefix("export ").strip().upper()] = v.strip().strip("'\"")
+    return d
+
+
+def bdecode(b, i=0):
+    c = b[i:i + 1]
+    if c == b"i":
+        j = b.index(b"e", i)
+        return int(b[i + 1:j]), j + 1
+    if c == b"l":
+        i += 1
+        out = []
+        while b[i:i + 1] != b"e":
+            v, i = bdecode(b, i)
+            out.append(v)
+        return out, i + 1
+    if c == b"d":
+        i += 1
+        out = {}
+        while b[i:i + 1] != b"e":
+            k, i = bdecode(b, i)
+            v, i = bdecode(b, i)
+            out[k] = v
+        return out, i + 1
+    j = b.index(b":", i)
+    n = int(b[i:j])
+    return b[j + 1:j + 1 + n], j + 1 + n
+
+
+def fingerprint(p):
+    h = hashlib.sha1()
+    size = os.path.getsize(p)
+    with open(p, "rb") as f:
+        h.update(f.read(1 << 20))
+        f.seek(max(0, size - (1 << 20)))
+        h.update(f.read(1 << 20))
+    return f"{size}:{h.hexdigest()}"
+
+
+class QBit:
+    def __init__(self):
+        self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.op.addheaders = [("Referer", QB)]
+        e = load_env(QB_ENV)
+        u = next((v for k, v in e.items() if "USER" in k), "")
+        p = next((v for k, v in e.items() if "PASS" in k), "")
+        try:
+            self.op.open(QB + "/api/v2/auth/login", urllib.parse.urlencode({"username": u, "password": p}).encode(), timeout=30).read()
+        except Exception:
+            pass
+
+    def get(self, path):
+        return json.loads(self.op.open(QB + path, timeout=120).read())
+
+    def post(self, path, data):
+        return self.op.open(QB + path, urllib.parse.urlencode(data).encode(), timeout=120).read()
+
+    def add(self, blob, fields):
+        b = uuid.uuid4().hex
+        parts = []
+        for k, v in fields.items():
+            parts.append(f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        parts.append(f'--{b}\r\nContent-Disposition: form-data; name="torrents"; filename="t.torrent"\r\nContent-Type: application/x-bittorrent\r\n\r\n'.encode() + blob + b"\r\n")
+        parts.append(f"--{b}--\r\n".encode())
+        req = urllib.request.Request(QB + "/api/v2/torrents/add", data=b"".join(parts), headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+        return self.op.open(req, timeout=120).read().decode()
+
+
+def load():
+    with open(DB) as f:
+        return json.load(f)
+
+
+def pick(db, q):
+    q = q.lower()
+    hits = [(h, e) for h, e in db["t"].items() if e["status"] == "restorable" and (h.startswith(q) or norm(q) in norm(e["name"]))]
+    if not hits:
+        die(f"no restorable torrent matches '{q}' (run: reseed --list)")
+    if len(hits) > 1:
+        for h, e in hits:
+            print(f"  {h[:12]}  {e.get('tracker', ''):<28} {e['name']}")
+        die("more than one match - use the hash shown above")
+    return hits[0]
+
+
+def torrent_files(info):
+    name = (info.get(b"name.utf-8") or info[b"name"]).decode()
+    if b"files" not in info:
+        return [(name, info[b"length"], False)]
+    out = []
+    for f in info[b"files"]:
+        parts = f.get(b"path.utf-8") or f[b"path"]
+        out.append(("/".join([name] + [p.decode() for p in parts]), f[b"length"], b"p" in f.get(b"attr", b"")))
+    return out
+
+
+def check_sources(e):
+    by_rel = {fe["rel"]: fe for fe in e["files"].values()}
+    for fe in by_rel.values():
+        s = fe.get("state")
+        if s == "linked" and (not os.path.exists(fe.get("lib", "")) or fingerprint(fe["lib"]) != fe.get("fp")):
+            die(f"library file changed or missing: {fe.get('lib')} - not restorable anymore")
+        if s == "patched" and (not os.path.exists(fe.get("lib", "")) or fingerprint(fe["lib"]) != fe.get("lib_fp")):
+            die(f"library file changed or missing: {fe.get('lib')} - patch no longer applies")
+        if s == "copied" and not os.path.exists(fe.get("copy", "")):
+            die(f"archived small file missing: {fe.get('copy')}")
+    return by_rel
+
+
+def open_source(fe):
+    s = fe["state"]
+    if s == "copied":
+        return open(fe["copy"], "rb"), None
+    if s == "linked":
+        return open(fe["lib"], "rb"), None
+    p = subprocess.Popen(["xdelta3", "-d", "-c", "-s", fe["lib"], fe["patch"]], stdout=subprocess.PIPE)
+    return p.stdout, p
+
+
+def verify(h, e):
+    meta, _ = bdecode(open(f"{BASE}/torrents/{h}.torrent", "rb").read())
+    info = meta[b"info"]
+    pieces = info.get(b"pieces")
+    if not pieces:
+        die("v2-only torrent: piece check not supported, use the real reseed (qBittorrent rechecks it)")
+    plen = info[b"piece length"]
+    by_rel = check_sources(e)
+    total = len(pieces) // 20
+    good, idx, buf = 0, 0, bytearray()
+    for rel, length, pad in torrent_files(info):
+        if pad:
+            chunks = [bytes(length)]
+            src, proc = None, None
+        else:
+            fe = by_rel.get(rel)
+            if not fe:
+                die(f"file in .torrent but not in archive: {rel}")
+            src, proc = open_source(fe)
+            chunks = None
+        left = length
+        while left > 0:
+            data = chunks.pop() if chunks is not None else src.read(min(8 << 20, left))
+            if not data:
+                die(f"source ended early: {rel}")
+            left -= len(data)
+            buf += data
+            while len(buf) >= plen:
+                if hashlib.sha1(buf[:plen]).digest() == pieces[idx * 20:idx * 20 + 20]:
+                    good += 1
+                idx += 1
+                del buf[:plen]
+        if src:
+            src.close()
+        if proc and proc.wait() != 0:
+            die(f"xdelta3 failed for {rel}")
+    if buf:
+        if hashlib.sha1(buf).digest() == pieces[idx * 20:idx * 20 + 20]:
+            good += 1
+        idx += 1
+    return good, total
+
+
+def link_or_copy(src, dst):
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def build(h, e):
+    by_rel = check_sources(e)
+    libs = [fe["lib"] for fe in by_rel.values() if fe.get("state") in ("linked", "patched")]
+    root = next((r for r in ROOTS for l in libs if l.startswith(r + "/")), None)
+    if not root:
+        die("could not pick a target disk")
+    need = sum(fe["size"] for fe in by_rel.values() if fe.get("state") == "patched")
+    if need * 1.05 > shutil.disk_usage(root).free:
+        die(f"not enough free space on {root}: need {need / 1e9:.1f} GB for rebuilt files")
+    target = f"{root}/downloads/reseed"
+    for rel, fe in by_rel.items():
+        dst = os.path.join(target, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.exists(dst):
+            continue
+        s = fe["state"]
+        if s == "copied":
+            link_or_copy(fe["copy"], dst)
+        elif s == "linked":
+            link_or_copy(fe["lib"], dst)
+        elif s == "patched":
+            print(f"rebuilding {rel} ({fe['size'] / 1e9:.1f} GB)...")
+            subprocess.run(["xdelta3", "-d", "-f", "-s", fe["lib"], fe["patch"], dst], check=True)
+    return ROOTS[root] + "/reseed"
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        die("usage: reseed --list [filter] | reseed --check <name|hash> | reseed <name|hash>")
+    db = load()
+    if a[0] == "--list":
+        q = a[1].lower() if len(a) > 1 else ""
+        qb = QBit()
+        live = {t["hash"] for t in qb.get("/api/v2/torrents/info")}
+        for h, e in sorted(db["t"].items(), key=lambda x: x[1]["name"].lower()):
+            if e["status"] == "restorable" and (not q or norm(q) in norm(e["name"]) or q in e.get("tracker", "")):
+                print(f"{h[:12]}  {'seeding ' if h in live else 'archived'}  {e.get('tracker', ''):<28} {e['name']}")
+        return
+    if a[0] == "--check":
+        if len(a) < 2:
+            die("usage: reseed --check <name|hash>")
+        h, e = pick(db, a[1])
+        print(f"checking {e['name']} ({e.get('tracker')}) against its .torrent piece hashes...")
+        good, total = verify(h, e)
+        print(f"{good}/{total} pieces OK - {'RESTORABLE, byte-identical' if good == total else 'BROKEN, do not reseed'}")
+        return
+    h, e = pick(db, a[0])
+    qb = QBit()
+    if qb.get(f"/api/v2/torrents/info?hashes={h}"):
+        die("already in qBittorrent - nothing to do")
+    save = build(h, e)
+    blob = open(f"{BASE}/torrents/{h}.torrent", "rb").read()
+    r = qb.add(blob, {"savepath": save, "category": CATEGORY, "stopped": "true", "paused": "true", "skip_checking": "false", "contentLayout": "Original", "autoTMM": "false"})
+    print(f"added: {r}")
+    time.sleep(3)
+    qb.post("/api/v2/torrents/recheck", {"hashes": h})
+    print("rechecking...")
+    t0 = time.time()
+    while time.time() - t0 < 6 * 3600:
+        time.sleep(10)
+        t = qb.get(f"/api/v2/torrents/info?hashes={h}")
+        if not t:
+            continue
+        t = t[0]
+        if t["state"] in CHECKING:
+            continue
+        if t["progress"] >= 1:
+            try:
+                qb.post("/api/v2/torrents/start", {"hashes": h})
+            except urllib.error.HTTPError:
+                qb.post("/api/v2/torrents/resume", {"hashes": h})
+            print(f"100% verified - seeding {e['name']} on {e.get('tracker')}")
+        else:
+            print(f"recheck reached only {t['progress'] * 100:.2f}% - left STOPPED, check it before starting")
+        return
+    print("recheck still running after 6h - check qBittorrent")
+
+
+if __name__ == "__main__":
+    main()

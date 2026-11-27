@@ -1,0 +1,20 @@
+#!/bin/bash
+base=$(cut -d'?' -f1 /etc/disk-alert.url)
+high=93
+low=88
+statedir=/var/lib/disk-alert
+mkdir -p "$statedir"
+prev=$(cat "$statedir/state" 2>/dev/null || echo up)
+max=0
+msg=""
+while read -r pct mnt; do
+  p=${pct%\%}
+  msg+="$mnt=$pct "
+  if [ "$p" -gt "$max" ]; then max=$p; fi
+done < <(df --output=pcent,target / /mnt/nvme /mnt/ssd /mnt/1tbhdd /mnt/4tbhdd | tail -n +2)
+if [ "$max" -ge "$high" ]; then st=down
+elif [ "$max" -lt "$low" ]; then st=up
+else st=$prev
+fi
+echo "$st" > "$statedir/state"
+curl -fsS -m 10 -G "$base" --data-urlencode "status=$st" --data-urlencode "msg=${msg% }" >/dev/null

@@ -1,0 +1,9 @@
+#!/bin/bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+export WAYLAND_DISPLAY=wayland-0
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+tv=$(cat /sys/class/drm/card*-HDMI-A-1/status 2>/dev/null | head -n 1)
+[ "$tv" = "connected" ] && tv="ON" || tv="off"
+audio=$(pactl list sink-inputs 2>/dev/null | awk '/Corked:/{c=$2} /application.name = /{n=$0; sub(/.*= "/,"",n); sub(/"$/,"",n); if(c=="no") print n}' | sort -u | paste -sd, -)
+win=$(kdotool getactivewindow getwindowname 2>/dev/null)
+echo "TV: $tv | Playing: ${audio:-nothing} | On screen: ${win:-nothing}"
